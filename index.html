@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>jetVue</title>
+    <meta name="viewport" content="initial-scale=1.0">
+    <meta charset="utf-8">
+    <link href="https://fonts.googleapis.com/css?family=Roboto" rel="stylesheet">
+    <link href="style.css" rel="stylesheet">
+    <script src="jetBlueData.js"></script>
+    <script src="mapStyle.js"></script>
+    <script
+      src="https://code.jquery.com/jquery-3.3.1.min.js"
+      integrity="sha256-FgpCb/KJQlLNfOu91ta32o/NMZxltwRo8QtmkMRdAu8="
+      crossorigin="anonymous"></script>
+    <script src="https://twitter.github.io/typeahead.js/releases/latest/typeahead.bundle.js"></script>
+  </head>
+  <body>
+    <div id="controls">
+      <h1>Let's go somewhere.</h1>
+      <div class="controls-inputs-container">
+        <div id="from-container">
+          <input class="airport-typeahead" type="text" placeholder="Where from?">
+          <span class="input-clear">&times;</span>
+        </div>
+        <div>to</div>
+        <div id="to-container">
+          <input class="airport-typeahead" type="text" placeholder="Where to?">
+          <span class="input-clear">&times;</span>
+        </div>
+      </div>
+      <div id="search-results-status-label">
+        <div>
+            We found <span id="status-shown-flights"></span> 
+            <span id="status-flight-type" href="#"></span> 
+            flight<span id="status-flights-s"></span> <span id="status-from">from ABC</span> 
+            <span id="status-to">to XYZ</span> 
+            <span id="status-hidden">(1 hidden)</span> 
+            <a id="show-flight-detail" href="#">Show List<span id="status-flights-s"></span></a>
+        </div>
+        <div>
+          <a id="status-switch-type" href="#"></a>
+        </div>
+      </div>
+    </div>
+    <div id="map"></div>
+    <div id="darkness" class="darkness dark"></div>
+    <div id="route-detail">
+      <div>Route 1</div>
+      <div>Route 2</div>
+      <div>Route 3</div>
+    </div>
+    <div id="route-detail-darkness" class="darkness"></div>
+    <script>
+      let map
+      let activePaths = []
+      let currentSrc = null
+      let currentDest = null
+      let showConnectingFlights = false
+      const FEELING_LUCKY = "I'm Feeling Lucky"
+      
+      function initMap() {
+        map = new google.maps.Map(document.getElementById('map'), {
+          center: {lat: 40, lng: -95},
+          disableDefaultUI: true,
+          zoom: 4,
+          zoomControl: true
+        })
+
+        setMapStyle(map)
+        makeHeatmap()
+      }
+
+      $("#search-results-status-label").hide()
+      $("#route-detail").hide()
+
+      const typeaheadDataSrc = {
+        display: 'code',
+        name: 'airports',
+        source: airportMatcher,
+        templates: {
+          suggestion: makeTypeaheadSuggestion
+        }
+      }
+
+      $('#from-container .airport-typeahead').typeahead({
+        hint: true,
+        highlight: true,
+        minLength: 1
+      }, typeaheadDataSrc).bind("typeahead:change", function(ev, val) {
+        if (!jetBlueData.airports[val] && val !== '') {
+          val = ''
+          $(this).typeahead('val', val)
+          currentSrc = val
+        }
+        refreshPaths()
+      })
+
+      $('#to-container .airport-typeahead').typeahead({
+        hint: true,
+        highlight: true,
+        minLength: 0
+      }, typeaheadDataSrc).bind("typeahead:change", function(ev, val) {
+        if (!jetBlueData.airports[val] && val !== '') {
+          val = ''
+          $(this).typeahead('val', val)
+          currentDest = val
+        }
+        refreshPaths()
+      })
+
+      $('#from-container .airport-typeahead').bind('typeahead:select', function(ev, srcAirport) {
+        currentSrc = srcAirport
+        refreshPaths()
+        $("#to-container .airport-typeahead").focus()
+        $(this).typeahead('val', jetBlueData.airports[srcAirport].DefaultDisplayName)
+      }).focus()
+
+      $("#from-container .input-clear").click(function() {
+        currentSrc = null
+        refreshPaths()
+        $('#from-container .airport-typeahead').typeahead('val', '').focus()
+      })
+
+      $("#to-container .input-clear").click(() => {
+        currentDest = null
+        refreshPaths()
+        $('#to-container .airport-typeahead').typeahead('val', '').focus()
+      })
+
+      $('#to-container .airport-typeahead').bind('typeahead:select', function(ev, destAirport) {
+        if (destAirport === FEELING_LUCKY) {
+          destAirport = pickRandomDestination()
+        }
+        currentDest = destAirport
+        refreshPaths()
+        $(this).blur()
+          .typeahead('val', jetBlueData.airports[destAirport].DefaultDisplayName)        
+      })
+
+      $("#status-switch-type").click(() => {
+        showConnectingFlights = !showConnectingFlights
+        refreshPaths()
+      })
+
+      $("#show-flight-detail").click(showRouteDetail)
+
+      $("#controls").hover(() => {
+        $("#darkness").addClass('dark')
+      }, () => {
+        if (currentDest || currentSrc) {
+          $("#darkness").removeClass('dark')
+        }
+      })
+
+      $("#route-detail-darkness").click(function() {
+        $(this).removeClass("dark")
+        $("#route-detail").fadeOut()
+      })
+
+      function airportMatcher(q, cb) {
+        if (q === '') {
+          cb([FEELING_LUCKY])
+          return
+        }
+        let matches = []
+        let substringRegex = new RegExp(q, 'i')
+        for (let airportCode in jetBlueData.airports) {
+          let airport = jetBlueData.airports[airportCode]
+          if (airport.ChildrenMACCodes) continue // skip areas, only look at real airports
+          if (substringRegex.test(airportCode)
+            || substringRegex.test(airport.DefaultDisplayName)) {
+            matches.push(airportCode)
+          }
+        }
+        cb(matches)
+      }
+
+      function makeHeatmap() {
+        let heatmapData = []
+        let allAirports = []
+        for (let {ap1, ap2, ap3} of jetBlueData.routes) {
+          allAirports.push(ap1)
+          if (ap2) allAirports.push(ap2)
+          allAirports.push(ap3)
+        }
+        for (let ap of allAirports) {
+          let {lat, lng} = jetBlueData.airports[ap].Location
+          heatmapData.push(new google.maps.LatLng(lat, lng))
+        }
+        let heatmap = new google.maps.visualization.HeatmapLayer({
+          data: heatmapData
+        })
+        setHeatmapGradient(heatmap)
+        heatmap.setMap(map)
+      }
+
+      function matchingRoutes(includeConnections=false) {
+        const routes = []
+        for (let route of jetBlueData.routes) {
+          if (!includeConnections && !showConnectingFlights && route.ap2) continue
+          if ((!currentSrc || route.ap1 === currentSrc)
+            && (!currentDest || route.ap3 == currentDest)) {
+            routes.push(route)
+          }
+        }
+        return routes
+      }
+
+      function refreshPaths() {
+        for (let path of activePaths) {
+          path.setMap(null)
+        }
+        activePaths = []
+        if (!currentSrc && !currentDest) {
+          updateStatus()          
+          return
+        }
+
+        let matching = matchingRoutes()
+        if (!matching.length && !showConnectingFlights) {
+          showConnectingFlights = true
+          matching = matchingRoutes()
+        }
+        for (let route of matching) {
+          let path = routeToStyledPath(route)
+          path.setMap(map)
+          activePaths.push(path)
+        }
+
+        updateStatus()
+      }
+
+      function updateStatus() {
+        if (currentSrc) {
+          $("#from-container .input-clear").addClass('show')
+        } else {
+          $("#from-container .input-clear").removeClass('show')          
+        }
+        if (currentDest) {
+          $("#to-container .input-clear").addClass('show')
+        } else {
+          $("#to-container .input-clear").removeClass('show')          
+        }
+
+        if (!currentSrc && !currentDest) {
+          $("#search-results-status-label").hide()
+          return
+        }
+
+        let allRoutes = matchingRoutes(true)
+        let viewingRoutes = matchingRoutes()
+        let hidden = allRoutes.length - viewingRoutes.length
+
+        let hasDirectFlight = allRoutes.filter(r => !r.ap2).length > 0
+
+        $("#status-flight-type").text(showConnectingFlights ? "" : "direct")
+        $("#status-switch-type").text(showConnectingFlights
+          ? (hasDirectFlight ? "Hide Connecting Flights" : "")
+          : "Show Connecting Flights")
+        $("#status-shown-flights").text(viewingRoutes.length)
+        $("#status-flights-s").text(viewingRoutes.length === 1 ? '' : 's')
+        $("#status-hidden").text(hidden > 0 ? `(${hidden} connections hidden)` : "")
+        $("#status-from").text(currentSrc ? `from ${currentSrc}`: "")
+        $("#status-to").text(currentDest ? `to ${currentDest}` : "")
+
+        $("#search-results-status-label").fadeIn()
+      }
+
+      function pickRandomDestination() {
+        let choices = []
+        for (let {ap1, ap2, ap3} of jetBlueData.routes) {
+          if ((!currentSrc || ap1 === currentSrc)
+            && (showConnectingFlights || !ap2)) {
+            choices.push(ap3)
+          }
+        }
+        return choices[Math.floor(Math.random()*choices.length)]
+      }
+
+      function makeTypeaheadSuggestion(airportCode) {
+        if (airportCode === FEELING_LUCKY) {
+          return $("<div/>").text(FEELING_LUCKY)[0]
+        }
+        return $("<div/>").text(jetBlueData.airports[airportCode].DefaultDisplayName)[0]
+      }
+
+      function showRouteDetail() {
+        $("#route-detail").html('')
+        addLength(matchingRoutes())
+          .sort((a, b) => a.dist - b.dist)
+          .forEach(route => {
+          let routeStr = [route.ap1, route.ap2, route.ap3].filter(Boolean).join(" -> ")
+          let elem = $("<div/>").text(routeStr + ` (${route.dist} miles)${route.isSeasonal?'*':''}`)
+          if (route.isMint) {
+            elem.addClass("route-mint")
+          }
+          elem.appendTo("#route-detail")
+        })
+        $("#route-detail").fadeIn()
+        $("#route-detail-darkness").addClass("dark")
+      }
+
+      function addLength(routes) {
+        return routes.map(r => {
+          let pos1 = jetBlueData.airports[r.ap1].Location
+          let pos2 = r.ap2 ? jetBlueData.airports[r.ap2].Location : null
+          let pos3 = jetBlueData.airports[r.ap3].Location
+
+          if (pos2) {
+            r.dist = latLngDist(pos1.lat, pos1.lng, pos2.lat, pos2.lng)
+              + latLngDist(pos2.lat, pos2.lng, pos3.lat, pos3.lng)
+          } else {
+            r.dist = latLngDist(pos1.lat, pos1.lng, pos3.lat, pos3.lng)
+          }
+          return r
+        })
+      }
+
+      // From https://www.movable-type.co.uk/scripts/latlong.html
+      // Returns length in miles
+      function latLngDist(lat1, lon1, lat2, lon2) {
+        var R = 6371e3 / 1609.344; // miles
+        var φ1 = toRad(lat1);
+        var φ2 = toRad(lat2);
+        var Δφ = toRad(lat2-lat1);
+        var Δλ = toRad(lon2-lon1);
+
+        var a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
+                Math.cos(φ1) * Math.cos(φ2) *
+                Math.sin(Δλ/2) * Math.sin(Δλ/2);
+        var c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+
+        return Math.round(R * c);
+      }
+
+      function toRad(n) {
+        return n * Math.PI / 180
+      }
+    </script>
+    <script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyB5MTu8NNY6Pc_Wx6MRyw_oYb8fhUIkTD4&callback=initMap&libraries=visualization"
+      async defer></script>
+  </body>
+</html>
